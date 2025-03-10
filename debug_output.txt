@@ -1,0 +1,140 @@
+2025-03-09 20:49:27.075 Python[45211:1707137] WARNING: Secure coding is not enabled for restorable state! Enable secure coding by implementing NSApplicationDelegate.applicationSupportsSecureRestorableState: and returning YES.
+Successfully loaded GeoJSON from /Users/l.greene32/Desktop/School/Senior/CTIS 440/Energy-Predictive-Model/NCCountyBoundaries.geojson
+GeoJSON contains 100 features
+Checking and fixing GeoJSON properties
+Sample feature properties: {'OBJECTID': 1, 'County': 'Alamance', 'FIPS': '001', 'Rec_Survey': 'Recorded survey data is available. Visit North Carolina Geodetic Survey for information. https://ncgs.state.nc.us', 'NCGS_url': 'https://ncem-gis.maps.arcgis.com/apps/webappviewer/index.html?id=8f3edbd62c004edd8b4fe3640f224738', 'ck_date': 'Mon, 13 Jan 2025 00:00:00 GMT'}
+Fixed properties for 100 features
+Features with NAME property: 100 of 100
+Loaded 500 historical records
+Sample historical data:             County  Year  ...  no_heating  heated_by_lp_gas
+0  Alamance County  1990  ...          64              4006
+1  Alamance County  2000  ...          78              6511
+2  Alamance County  2010  ...          55              6194
+3  Alamance County  2015  ...         232              5119
+4  Alamance County  2020  ...         369              4005
+
+[5 rows x 8 columns]
+Historical years: [1990 2000 2010 2015 2020]
+Loaded 400 prediction records
+Sample prediction data:              County  Year  ...  no_heating  heated_by_lp_gas
+0   Alamance County  2025  ...         329              2668
+1   Alamance County  2030  ...         373              1554
+2   Alamance County  2035  ...         418               440
+3   Alamance County  2040  ...         462              -674
+4  Alexander County  2025  ...         110              1059
+
+[5 rows x 8 columns]
+Prediction years: [2025 2030 2035 2040]
+Heating types: ['heated_by_electricity', 'heated_by_gas', 'heated_by_fuel_oil', 'heated_by_other', 'no_heating', 'heated_by_lp_gas']
+Updating map for: Year=0, Heating Type=heated_by_electricity, Source=All Data
+No data for year 0, using closest available year: 1990
+Found 100 records for year 1990
+Created mapping for 200 counties
+Value range: 405 to 94102
+County mappings (sample):
+  Alamance County → Alamance
+  Alexander County → Alexander
+  Alleghany County → Alleghany
+  Anson County → Anson
+  Ashe County → Ashe
+Counties matched with GeoJSON: 100 of 100
+Map updated successfully
+Year range: 1990-2040
+Updating map for: Year=1990, Heating Type=heated_by_electricity, Source=All Data
+Found 100 records for year 1990
+Created mapping for 200 counties
+Value range: 405 to 94102
+County mappings (sample):
+  Alamance County → Alamance
+  Alexander County → Alexander
+  Alleghany County → Alleghany
+  Anson County → Anson
+  Ashe County → Ashe
+Counties matched with GeoJSON: 100 of 100
+Map updated successfully
+Data loaded successfully. Year range: 1990-2040
+Updating map for: Year=1990, Heating Type=heated_by_electricity, Source=All Data
+Found 100 records for year 1990
+Created mapping for 200 counties
+Value range: 405 to 94102
+County mappings (sample):
+  Alamance County → Alamance
+  Alexander County → Alexander
+  Alleghany County → Alleghany
+  Anson County → Anson
+  Ashe County → Ashe
+Counties matched with GeoJSON: 100 of 100
+Map updated successfully
+Updating map for: Year=1991, Heating Type=heated_by_electricity, Source=All Data
+No data for year 1991, using closest available year: 1990
+Found 100 records for year 1990
+Created mapping for 200 counties
+Value range: 405 to 94102
+County mappings (sample):
+  Alamance County → Alamance
+  Alexander County → Alexander
+  Alleghany County → Alleghany
+  Anson County → Anson
+  Ashe County → Ashe
+Counties matched with GeoJSON: 100 of 100
+Map updated successfully
+Updating map for: Year=2000, Heating Type=heated_by_electricity, Source=All Data
+Found 100 records for year 2000
+Created mapping for 200 counties
+Value range: 522 to 118653
+County mappings (sample):
+  Alamance County → Alamance
+  Alexander County → Alexander
+  Alleghany County → Alleghany
+  Anson County → Anson
+  Ashe County → Ashe
+Counties matched with GeoJSON: 100 of 100
+Map updated successfully
+Updating map for: Year=1990, Heating Type=heated_by_electricity, Source=All Data
+Found 100 records for year 1990
+Created mapping for 200 counties
+Value range: 405 to 94102
+County mappings (sample):
+  Alamance County → Alamance
+  Alexander County → Alexander
+  Alleghany County → Alleghany
+  Anson County → Anson
+  Ashe County → Ashe
+Counties matched with GeoJSON: 100 of 100
+Map updated successfully
+Updating map for: Year=2000, Heating Type=heated_by_electricity, Source=All Data
+Found 100 records for year 2000
+Created mapping for 200 counties
+Value range: 522 to 118653
+County mappings (sample):
+  Alamance County → Alamance
+  Alexander County → Alexander
+  Alleghany County → Alleghany
+  Anson County → Anson
+  Ashe County → Ashe
+Counties matched with GeoJSON: 100 of 100
+Map updated successfully
+Updating map for: Year=2040, Heating Type=heated_by_electricity, Source=All Data
+Found 100 records for year 2040
+Created mapping for 200 counties
+Value range: 1068 to 340099
+County mappings (sample):
+  Alamance County → Alamance
+  Alexander County → Alexander
+  Alleghany County → Alleghany
+  Anson County → Anson
+  Ashe County → Ashe
+Counties matched with GeoJSON: 100 of 100
+Map updated successfully
+Updating map for: Year=2040, Heating Type=heated_by_fuel_oil, Source=All Data
+Found 100 records for year 2040
+Created mapping for 200 counties
+Value range: -4185 to 3407
+County mappings (sample):
+  Alamance County → Alamance
+  Alexander County → Alexander
+  Alleghany County → Alleghany
+  Anson County → Anson
+  Ashe County → Ashe
+Counties matched with GeoJSON: 100 of 100
+Map updated successfully
