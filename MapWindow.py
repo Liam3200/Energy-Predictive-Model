@@ -11,8 +11,7 @@ from PyQt5.QtWidgets import *
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtCore import QUrl, Qt
 import sqlite3
-import urllib.request
-from prophet import Prophet  # Make sure this is installed
+from prophet import Prophet 
 
 class EnergyMapWindow(QMainWindow):
     def __init__(self):
@@ -568,10 +567,33 @@ class EnergyMapWindow(QMainWindow):
                 tiles='CartoDB positron'
             )
             
-            # Extract selected heating type data
+            # Calculate percentages for each county
+            # Get all heating types
+            heating_types = [col for col in df.columns 
+                           if col not in ['County', 'Year']]
+            
+            # Copy all heating type data for calculating percentages
+            df_all_types = df[['County'] + heating_types].copy()
+            
+            # Calculate total energy usage across all types for each county
+            df_all_types['total_energy'] = df_all_types[heating_types].sum(axis=1)
+            
+            # Calculate percentage for the selected heating type
+            df_all_types['percentage'] = (df_all_types[heating_type] / df_all_types['total_energy'] * 100).round(1)
+            
+            # Extract selected heating type data with percentage
             df_subset = df[['County', heating_type]].copy()
             df_subset = df_subset.rename(columns={heating_type: 'value'})
+            
+            # Add percentage to df_subset by merging
+            df_subset = df_subset.merge(
+                df_all_types[['County', 'percentage']], 
+                on='County', 
+                how='left'
+            )
+            
             print(f"Value range: {df_subset['value'].min()} to {df_subset['value'].max()}")
+            print(f"Percentage range: {df_subset['percentage'].min()}% to {df_subset['percentage'].max()}%")
             
             # Normalize county names for matching with GeoJSON
             # First remove ' County' suffix if present
@@ -604,6 +626,7 @@ class EnergyMapWindow(QMainWindow):
             for _, row in df_subset.iterrows():
                 county = row['GeoJSON_County']
                 value = row['value']
+                percentage = row['percentage']
                 
                 # Find matching feature in original GeoJSON
                 matching_feature = None
@@ -618,7 +641,8 @@ class EnergyMapWindow(QMainWindow):
                         "type": "Feature",
                         "properties": {
                             "NAME": county,
-                            "value": float(value)
+                            "value": float(value),
+                            "percentage": float(percentage)
                         },
                         "geometry": matching_feature['geometry']
                     }
@@ -642,14 +666,23 @@ class EnergyMapWindow(QMainWindow):
                     }
                 ).add_to(m)
                 
-                # Add tooltips
+                # Add enhanced tooltips with percentage
                 folium.GeoJsonTooltip(
-                    fields=['NAME', 'value'],
-                    aliases=['County:', f'{heating_type}:'],
-                    style='background-color: white; color: #333333; font-family: arial; font-size: 12px; padding: 10px;',
+                    fields=['NAME', 'value', 'percentage'],
+                    aliases=['County:', f'{heating_type}:', 'Percentage of Total:'],
+                    labels=True,
                     localize=True,
                     sticky=False,
-                    labels=True,
+                    style='''
+                        background-color: white; 
+                        color: #333333; 
+                        font-family: arial; 
+                        font-size: 12px; 
+                        padding: 10px;
+                        border-radius: 3px;
+                        box-shadow: 0 1px 5px rgba(0,0,0,0.4);
+                    ''',
+                    toLocaleString=True
                 ).add_to(choropleth)
                 
                 # Add a legend
@@ -1019,7 +1052,7 @@ class EnergyMapWindow(QMainWindow):
             QMessageBox.warning(self, "Error", f"Failed to generate plot: {str(e)}")
 
     def generate_prophet_model(self, df, county, heating_type):
-        """Generate Prophet model and forecast"""
+        """Generate Prophet model and forecast using population data"""
         try:
             # Ensure Prophet library is available
             try:
@@ -1029,7 +1062,63 @@ class EnergyMapWindow(QMainWindow):
                                   "Prophet library is required for forecasting. Please install prophet package.")
                 return None
                 
-            # Prepare data for Prophet (ds = date, y = value)
+            # Get population data for this county
+            population_query = """
+            SELECT Population_1990, Population_2000, Population_2010, Population_2020
+            FROM county_populations
+            WHERE County = ?
+            """
+            try:
+                pop_df = pd.read_sql_query(population_query, self.conn, params=[county])
+                
+                if pop_df.empty:
+                    print(f"No population data found for {county}")
+                    # Continue without population data
+                    has_population = False
+                else:
+                    has_population = True
+                    
+                    # Create population series with years as index
+                    pop_series = pd.Series([
+                        pop_df['Population_1990'].iloc[0],
+                        pop_df['Population_2000'].iloc[0],
+                        pop_df['Population_2010'].iloc[0],
+                        pop_df['Population_2020'].iloc[0]
+                    ], index=[1990, 2000, 2010, 2020])
+                    
+                    # Fill NaN values with median
+                    pop_series = pop_series.fillna(pop_series.median())
+                    
+                    # Extrapolate population for future years
+                    from sklearn.linear_model import LinearRegression
+                    import numpy as np
+                    
+                    years = np.array(pop_series.index).reshape(-1, 1)
+                    values = np.array(pop_series.values)
+                    
+                    # Check if we have enough valid data
+                    if len(years) < 2 or np.isnan(values).any() or np.all(values == 0):
+                        has_population = False
+                    else:
+                        model = LinearRegression()
+                        model.fit(years, values)
+                        
+                        # Predict future populations
+                        future_years = np.array(range(1990, 2041)).reshape(-1, 1)
+                        future_populations = model.predict(future_years)
+                        
+                        # Ensure predictions are positive
+                        future_populations = np.maximum(future_populations, 100)
+                        
+                        # Create a population lookup for all years
+                        population_lookup = {
+                            year: pop for year, pop in zip(range(1990, 2041), future_populations)
+                        }
+            except Exception as pop_error:
+                print(f"Error retrieving population data: {pop_error}")
+                has_population = False
+            
+            # Prepare data for Prophet
             # Ensure proper data types to prevent ambiguity errors
             df['Year'] = df['Year'].astype(int)
             df['value'] = pd.to_numeric(df['value'], errors='coerce')
@@ -1040,10 +1129,21 @@ class EnergyMapWindow(QMainWindow):
                 median_val = df['value'].median()
                 df['value'] = df['value'].fillna(median_val)
             
+            # Create Prophet dataframe
             prophet_df = pd.DataFrame({
                 'ds': pd.to_datetime(df['Year'].astype(str) + '-01-01'),  # Use January 1st for each year
                 'y': df['value']
             })
+            
+            # Add population as a regressor if available
+            if has_population:
+                prophet_df['population'] = prophet_df['ds'].dt.year.map(
+                    lambda y: population_lookup.get(y, population_lookup.get(2020, 1000))
+                )
+                
+                # Add per capita column for scaling
+                prophet_df['per_capita'] = prophet_df['y'] / prophet_df['population']
+                prophet_df['per_capita'] = prophet_df['per_capita'].fillna(prophet_df['per_capita'].median())
             
             print(f"Prophet input: {len(prophet_df)} points, from {prophet_df['ds'].min().year} to {prophet_df['ds'].max().year}")
             
@@ -1051,9 +1151,13 @@ class EnergyMapWindow(QMainWindow):
             model = Prophet(
                 yearly_seasonality=False,
                 growth='linear',
-                changepoint_prior_scale=0.5,
+                changepoint_prior_scale=0.1,  # More conservative
                 interval_width=0.95  # 95% confidence interval
             )
+            
+            # Add population as a regressor if available
+            if has_population:
+                model.add_regressor('population')
             
             # Fit model with error handling
             try:
@@ -1067,8 +1171,18 @@ class EnergyMapWindow(QMainWindow):
                 'ds': pd.date_range(start='1990-01-01', end='2040-12-31', freq='YS')
             })
             
+            # Add population to future dataframe if available
+            if has_population:
+                future['population'] = future['ds'].dt.year.map(
+                    lambda y: population_lookup.get(y, population_lookup.get(2020, 1000))
+                )
+            
             # Make predictions
             forecast = model.predict(future)
+            
+            # Ensure predictions are non-negative
+            forecast['yhat'] = np.maximum(forecast['yhat'], 0)
+            forecast['yhat_lower'] = np.maximum(forecast['yhat_lower'], 0)
             
             # Add actual historical data
             forecast_with_history = forecast.copy()
