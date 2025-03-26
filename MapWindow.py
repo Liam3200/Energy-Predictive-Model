@@ -5,13 +5,17 @@ import pandas as pd
 import numpy as np
 import geopandas as gpd
 import folium
+import matplotlib.pyplot as plt
+import io
 from folium import Choropleth, LayerControl, features
 from branca.colormap import linear
 from PyQt5.QtWidgets import *
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtCore import QUrl, Qt
+from PyQt5.QtGui import QPixmap
 import sqlite3
-from prophet import Prophet 
+from prophet import Prophet
+from sklearn.linear_model import LinearRegression  
 
 class EnergyMapWindow(QMainWindow):
     def __init__(self):
@@ -1034,10 +1038,10 @@ class EnergyMapWindow(QMainWindow):
                 model_data = self.generate_prophet_model(df, county, heating_type)
                 
                 if model_data is not None:
-                    # Use plotly to create interactive visualization
+                    # Use the new display_plotly_forecast method
                     self.display_plotly_forecast(model_data, county, heating_type)
                 else:
-                    QMessageBox.warning(self, "Error", "Failed to generate forecast model")
+                    QMessageBox.warning(self, "Forecast Error", "Failed to generate forecast model")
             except Exception as model_error:
                 print(f"Error in model generation: {str(model_error)}")
                 QMessageBox.warning(self, "Model Error", f"Error generating forecast model: {str(model_error)}")
@@ -1046,13 +1050,11 @@ class EnergyMapWindow(QMainWindow):
             
         except Exception as e:
             QApplication.restoreOverrideCursor()  # Always restore cursor
-            import traceback
             print(f"Error generating plot: {str(e)}")
-            print(f"Traceback: {traceback.format_exc()}")
             QMessageBox.warning(self, "Error", f"Failed to generate plot: {str(e)}")
 
     def generate_prophet_model(self, df, county, heating_type):
-        """Generate Prophet model and forecast using population data"""
+        """Generate Prophet model and forecast using population data with uncertainty visualization"""
         try:
             # Ensure Prophet library is available
             try:
@@ -1061,143 +1063,284 @@ class EnergyMapWindow(QMainWindow):
                 QMessageBox.warning(self, "Missing Dependency", 
                                   "Prophet library is required for forecasting. Please install prophet package.")
                 return None
+            
+            # First, get ALL energy types for this county to understand distribution
+            all_energy_query = """
+            SELECT Year, 
+                   heated_by_electricity, heated_by_gas, heated_by_fuel_oil, 
+                   heated_by_other, no_heating, heated_by_lp_gas
+            FROM energy_consumption
+            WHERE County = ?
+            ORDER BY Year
+            """
+            energy_df = pd.read_sql_query(all_energy_query, self.conn, params=[county])
+            
+            if energy_df.empty:
+                print(f"No energy data found for {county}")
+                return None
                 
             # Get population data for this county
             population_query = """
             SELECT Population_1990, Population_2000, Population_2010, Population_2020
             FROM county_populations
-            WHERE County = ?
+            WHERE County = ? OR County = ? OR County LIKE ?
             """
-            try:
-                pop_df = pd.read_sql_query(population_query, self.conn, params=[county])
-                
-                if pop_df.empty:
-                    print(f"No population data found for {county}")
-                    # Continue without population data
-                    has_population = False
-                else:
-                    has_population = True
-                    
-                    # Create population series with years as index
-                    pop_series = pd.Series([
-                        pop_df['Population_1990'].iloc[0],
-                        pop_df['Population_2000'].iloc[0],
-                        pop_df['Population_2010'].iloc[0],
-                        pop_df['Population_2020'].iloc[0]
-                    ], index=[1990, 2000, 2010, 2020])
-                    
-                    # Fill NaN values with median
-                    pop_series = pop_series.fillna(pop_series.median())
-                    
-                    # Extrapolate population for future years
-                    from sklearn.linear_model import LinearRegression
-                    import numpy as np
-                    
-                    years = np.array(pop_series.index).reshape(-1, 1)
-                    values = np.array(pop_series.values)
-                    
-                    # Check if we have enough valid data
-                    if len(years) < 2 or np.isnan(values).any() or np.all(values == 0):
-                        has_population = False
-                    else:
-                        model = LinearRegression()
-                        model.fit(years, values)
-                        
-                        # Predict future populations
-                        future_years = np.array(range(1990, 2041)).reshape(-1, 1)
-                        future_populations = model.predict(future_years)
-                        
-                        # Ensure predictions are positive
-                        future_populations = np.maximum(future_populations, 100)
-                        
-                        # Create a population lookup for all years
-                        population_lookup = {
-                            year: pop for year, pop in zip(range(1990, 2041), future_populations)
-                        }
-            except Exception as pop_error:
-                print(f"Error retrieving population data: {pop_error}")
-                has_population = False
             
-            # Prepare data for Prophet
-            # Ensure proper data types to prevent ambiguity errors
+            base_county = county.replace(' County', '')
+            pop_df = pd.read_sql_query(population_query, self.conn, 
+                                      params=[county, base_county, f"{base_county}%"])
+            
+            # Calculate minimum values based on historical data to prevent unrealistically low values
+            min_values = {}
+            for col in ['heated_by_electricity', 'heated_by_gas', 'heated_by_fuel_oil', 
+                      'heated_by_other', 'no_heating', 'heated_by_lp_gas']:
+                # Get non-zero values
+                non_zero_values = energy_df[energy_df[col] > 0][col]
+                if not non_zero_values.empty:
+                    # Set minimum to either 5% of the mean non-zero value or 1, whichever is larger
+                    min_values[col] = max(int(non_zero_values.mean() * 0.05), 1)
+                else:
+                    min_values[col] = 1
+            
+            # Get population data (create synthetic if needed)
+            if pop_df.empty:
+                print(f"No population data found for {county}")
+                # Create synthetic population based on housing units
+                energy_df['Population'] = None
+                # Use NC state average population growth rates as fallback
+                nc_growth_rates = {
+                    1990: 0.8,   # base
+                    2000: 0.9,   # ~12% growth from 1990
+                    2010: 1.0,   # ~18% growth from 2000
+                    2020: 1.1,   # ~10% growth from 2010
+                    2025: 1.15,  # projected
+                    2030: 1.2,   # projected
+                    2035: 1.25,  # projected
+                    2040: 1.3    # projected
+                }
+                
+                # Create synthetic population based on total housing and state growth
+                base_year = energy_df['Year'].min()
+                base_housing = energy_df.loc[energy_df['Year'] == base_year, 
+                                          ['heated_by_electricity', 'heated_by_gas', 'heated_by_fuel_oil', 
+                                           'heated_by_other', 'no_heating', 'heated_by_lp_gas']].sum(axis=1).iloc[0]
+                
+                energy_df['Population'] = energy_df['Year'].apply(
+                    lambda y: base_housing * 2.5 * nc_growth_rates.get(y, 1) if y in nc_growth_rates else None
+                )
+                population_years = {y: p for y, p in zip(energy_df['Year'], energy_df['Population'])}
+            else:
+                # Create population series with years as index
+                population_years = {
+                    1990: pop_df['Population_1990'].iloc[0] if not pd.isna(pop_df['Population_1990'].iloc[0]) else None,
+                    2000: pop_df['Population_2000'].iloc[0] if not pd.isna(pop_df['Population_2000'].iloc[0]) else None,
+                    2010: pop_df['Population_2010'].iloc[0] if not pd.isna(pop_df['Population_2010'].iloc[0]) else None,
+                    2020: pop_df['Population_2020'].iloc[0] if not pd.isna(pop_df['Population_2020'].iloc[0]) else None
+                }
+                
+                # Add population to energy dataframe
+                energy_df['Population'] = energy_df['Year'].map(population_years)
+            
+            # Fill any missing population values
+            energy_df = energy_df.sort_values('Year')
+            energy_df['Population'] = energy_df['Population'].interpolate().ffill().bfill()
+            
+            # Calculate total housing units and percentages
+            energy_df['total_housing'] = energy_df[['heated_by_electricity', 'heated_by_gas', 'heated_by_fuel_oil', 
+                                                'heated_by_other', 'no_heating', 'heated_by_lp_gas']].sum(axis=1)
+            
+            # Calculate housing per capita
+            energy_df['housing_per_capita'] = energy_df['total_housing'] / energy_df['Population']
+            energy_df['housing_per_capita'] = energy_df['housing_per_capita'].replace([np.inf, -np.inf], np.nan)
+            energy_df['housing_per_capita'] = energy_df['housing_per_capita'].fillna(energy_df['housing_per_capita'].median())
+            
+            # Determine decline rate thresholds based on energy type
+            decline_thresholds = {
+                'heated_by_electricity': 0,  # No decline floor for electricity (growing)
+                'heated_by_gas': 0.3,        # At least 30% of latest value for gas
+                'heated_by_fuel_oil': 0.4,   # At least 40% of latest value for fuel oil
+                'heated_by_other': 0.4,      # At least 40% of latest value for other
+                'no_heating': 0.5,           # At least 50% of latest value for no heating
+                'heated_by_lp_gas': 0.3      # At least 30% of latest value for LP gas
+            }
+            
+            # Get latest year data
+            latest_year = energy_df['Year'].max()
+            latest_data = energy_df[energy_df['Year'] == latest_year]
+            
+            # Project future population based on available data
+            pop_df = energy_df[['Year', 'Population']].dropna()
+            
+            if len(pop_df) >= 2:
+                # Calculate average annual growth rate
+                first_year = pop_df['Year'].min()
+                last_year = pop_df['Year'].max()
+                first_pop = pop_df.loc[pop_df['Year'] == first_year, 'Population'].iloc[0]
+                last_pop = pop_df.loc[pop_df['Year'] == last_year, 'Population'].iloc[0]
+                years_diff = last_year - first_year
+                
+                if years_diff > 0 and first_pop > 0:
+                    # Calculate compound annual growth rate
+                    annual_growth_rate = (last_pop / first_pop) ** (1 / years_diff) - 1
+                    
+                    # Ensure growth rate is realistic (between -0.5% and 3% per year)
+                    annual_growth_rate = max(-0.005, min(annual_growth_rate, 0.03))
+                    
+                    # Project future populations
+                    latest_pop = pop_df.loc[pop_df['Year'] == pop_df['Year'].max(), 'Population'].iloc[0]
+                    future_pop = {year: latest_pop * (1 + annual_growth_rate) ** (year - last_year) 
+                               for year in range(1990, 2041)}
+                else:
+                    # Fallback to state average growth
+                    latest_pop = pop_df.loc[pop_df['Year'] == pop_df['Year'].max(), 'Population'].iloc[0]
+                    future_pop = {
+                        2025: latest_pop * 1.05,
+                        2030: latest_pop * 1.10,
+                        2035: latest_pop * 1.15,
+                        2040: latest_pop * 1.20
+                    }
+            else:
+                # Simple growth for missing data
+                if latest_data.iloc[0]['Population'] > 0:
+                    latest_pop = latest_data.iloc[0]['Population']
+                else:
+                    # Estimate from housing if population data is missing
+                    latest_pop = latest_data.iloc[0]['total_housing'] * 2.5
+                    
+                future_pop = {
+                    2025: latest_pop * 1.05,
+                    2030: latest_pop * 1.10,
+                    2035: latest_pop * 1.15,
+                    2040: latest_pop * 1.20
+                }
+                
+            # Prepare data for Prophet from input dataframe
+            # Ensure proper data types
             df['Year'] = df['Year'].astype(int)
             df['value'] = pd.to_numeric(df['value'], errors='coerce')
             
-            # Check for missing values
+            # Replace missing values with median
             if df['value'].isnull().any():
-                print("Warning: Data contains NaN values, replacing with median")
                 median_val = df['value'].median()
                 df['value'] = df['value'].fillna(median_val)
             
             # Create Prophet dataframe
             prophet_df = pd.DataFrame({
-                'ds': pd.to_datetime(df['Year'].astype(str) + '-01-01'),  # Use January 1st for each year
-                'y': df['value']
+                'ds': pd.to_datetime(df['Year'].astype(str) + '-01-01'),  # January 1st for each year
+                'y': df['value'],
+                'population': df['Year'].map(lambda y: 
+                                   population_years.get(y, future_pop.get(y, latest_pop * 1.1))
+                               )
             })
             
-            # Add population as a regressor if available
-            if has_population:
-                prophet_df['population'] = prophet_df['ds'].dt.year.map(
-                    lambda y: population_lookup.get(y, population_lookup.get(2020, 1000))
-                )
-                
-                # Add per capita column for scaling
-                prophet_df['per_capita'] = prophet_df['y'] / prophet_df['population']
-                prophet_df['per_capita'] = prophet_df['per_capita'].fillna(prophet_df['per_capita'].median())
+            # Fill any missing population values
+            prophet_df['population'] = prophet_df['population'].interpolate().ffill().bfill()
             
-            print(f"Prophet input: {len(prophet_df)} points, from {prophet_df['ds'].min().year} to {prophet_df['ds'].max().year}")
-            
-            # Create and fit the model
+            # Create Prophet model
             model = Prophet(
                 yearly_seasonality=False,
                 growth='linear',
-                changepoint_prior_scale=0.1,  # More conservative
-                interval_width=0.95  # 95% confidence interval
+                changepoint_prior_scale=0.05,  # More conservative
+                interval_width=0.9  # 90% confidence interval
             )
             
-            # Add population as a regressor if available
-            if has_population:
-                model.add_regressor('population')
+            # Add population as a regressor
+            model.add_regressor('population')
             
-            # Fit model with error handling
+            # Fit model
             try:
                 model.fit(prophet_df)
-            except Exception as fit_error:
-                print(f"Error fitting Prophet model: {fit_error}")
+            except Exception as e:
+                print(f"Error fitting Prophet model: {str(e)}")
                 return None
             
-            # Create future dataframe for predictions
+            # Create future dataframe for all years
             future = pd.DataFrame({
                 'ds': pd.date_range(start='1990-01-01', end='2040-12-31', freq='YS')
             })
             
-            # Add population to future dataframe if available
-            if has_population:
-                future['population'] = future['ds'].dt.year.map(
-                    lambda y: population_lookup.get(y, population_lookup.get(2020, 1000))
-                )
+            # Add population to future dataframe
+            future['population'] = future['ds'].dt.year.map(
+                lambda y: population_years.get(y, future_pop.get(y, latest_pop * 1.1))
+            )
             
-            # Make predictions
+            # Make Prophet predictions
             forecast = model.predict(future)
+            
+            # Determine the latest value and apply decline thresholds
+            latest_value = None
+            for idx, row in df.iterrows():
+                if row['Year'] == latest_year:
+                    latest_value = row['value']
+                    break
+                    
+            if latest_value is None and len(df) > 0:
+                latest_value = df.iloc[-1]['value']
+                
+            # If we still don't have a value, use the predicted value for the latest year
+            if latest_value is None:
+                latest_mask = forecast['ds'].dt.year == latest_year
+                if latest_mask.any():
+                    latest_value = forecast.loc[latest_mask, 'yhat'].iloc[0]
+                else:
+                    latest_value = min_values.get(heating_type, 1)
+            
+            # Apply increasing uncertainty for future years
+            base_uncertainty = 0.1  # 10% for the first future year
+            for year in range(2025, 2041):
+                year_mask = forecast['ds'].dt.year == year
+                if year_mask.any():
+                    # Calculate years from latest historical data
+                    years_out = year - latest_year
+                    
+                    # Increase uncertainty by 5% for each 5 years into the future
+                    uncertainty_factor = 1.0 + (base_uncertainty * (years_out / 5))
+                    
+                    # Apply to confidence intervals - widen them proportionally
+                    idx = forecast.index[year_mask][0]
+                    mean_val = forecast.loc[idx, 'yhat']
+                    lower_diff = mean_val - forecast.loc[idx, 'yhat_lower'] 
+                    upper_diff = forecast.loc[idx, 'yhat_upper'] - mean_val
+                    
+                    # Apply wider intervals
+                    forecast.loc[idx, 'yhat_lower'] = mean_val - (lower_diff * uncertainty_factor)
+                    forecast.loc[idx, 'yhat_upper'] = mean_val + (upper_diff * uncertainty_factor)
+                    
+                    # For declining energy types, ensure we respect the minimum thresholds
+                    if heating_type in decline_thresholds and heating_type != 'heated_by_electricity':
+                        threshold = decline_thresholds[heating_type]
+                        # Apply progressively stronger floors for further years
+                        year_factor = max(0.1, 1 - (0.2 * (years_out / 5)))  # Gradual decline
+                        floor_value = latest_value * threshold * year_factor
+                        
+                        # Apply the floor, but ensure it's at least min_values[heating_type]
+                        min_val = max(floor_value, min_values.get(heating_type, 1))
+                        forecast.loc[idx, 'yhat'] = max(forecast.loc[idx, 'yhat'], min_val)
+                        forecast.loc[idx, 'yhat_lower'] = max(forecast.loc[idx, 'yhat_lower'], min_val * 0.8)
             
             # Ensure predictions are non-negative
             forecast['yhat'] = np.maximum(forecast['yhat'], 0)
             forecast['yhat_lower'] = np.maximum(forecast['yhat_lower'], 0)
+            forecast['yhat_upper'] = np.maximum(forecast['yhat_upper'], min_values.get(heating_type, 0))
+            
+            # Round values to integers since we're working with housing units
+            forecast['yhat'] = forecast['yhat'].round().astype(int)
+            forecast['yhat_lower'] = forecast['yhat_lower'].round().astype(int)
+            forecast['yhat_upper'] = forecast['yhat_upper'].round().astype(int)
             
             # Add actual historical data
             forecast_with_history = forecast.copy()
             forecast_with_history['actual'] = None
             forecast_with_history['source'] = None
             
-            # Map actual values to forecast by matching years
+            # Map actual values to forecast
             for _, row in df.iterrows():
                 year = int(row['Year'])
                 value = float(row['value'])
                 source = str(row['source'])
                 
-                # Find matching year in forecast using explicit comparison
                 mask = forecast_with_history['ds'].dt.year == year
-                if mask.any():  # Use .any() to evaluate boolean Series
+                if mask.any():
                     idx = forecast_with_history.index[mask][0]
                     forecast_with_history.loc[idx, 'actual'] = value
                     forecast_with_history.loc[idx, 'source'] = source
@@ -1211,7 +1354,7 @@ class EnergyMapWindow(QMainWindow):
             return None
 
     def display_plotly_forecast(self, forecast, county, heating_type):
-        """Display the Prophet forecast using Plotly"""
+        """Display the Prophet forecast using Plotly with accurate uncertainty visualization"""
         try:
             # Ensure plotly library is available
             try:
@@ -1237,24 +1380,57 @@ class EnergyMapWindow(QMainWindow):
             forecast['yhat_upper'] = pd.to_numeric(forecast['yhat_upper'], errors='coerce')
             forecast['yhat_lower'] = pd.to_numeric(forecast['yhat_lower'], errors='coerce')
             
-            # Add predicted line with confidence interval
-            fig.add_trace(
-                go.Scatter(
-                    x=forecast['ds'],
-                    y=forecast['yhat'],
-                    mode='lines',
-                    name='Forecast',
-                    line=dict(color='royalblue', width=2)
-                )
-            )
+            # Split forecast into historical and future periods
+            historical_mask = forecast['actual'].notna()
             
-            # Add confidence interval - handle separately to avoid shape errors
+            # Get the last year of historical data
             try:
+                # Get the last year with historical data
+                last_historical_year = forecast.loc[historical_mask, 'ds'].dt.year.max()
+                print(f"Last historical year: {last_historical_year}")
+            except:
+                # If there's an error, use 2020 as a fallback
+                last_historical_year = 2020
+                print(f"Using fallback historical year: {last_historical_year}")
+            
+            # Create prediction mask for points after the last historical year
+            prediction_mask = forecast['ds'].dt.year > last_historical_year
+            
+            # Add historical data points
+            if historical_mask.any():
+                historical_data = forecast[historical_mask]
+                fig.add_trace(
+                    go.Scatter(
+                        x=historical_data['ds'],
+                        y=historical_data['actual'],
+                        mode='markers+lines',
+                        name='Historical Data',
+                        line=dict(color='green', width=3),
+                        marker=dict(size=8, color='green')
+                    )
+                )
+            
+            # Separate the forecast display
+            if prediction_mask.any():
+                prediction_data = forecast[prediction_mask]
+                
+                # Add main prediction line
+                fig.add_trace(
+                    go.Scatter(
+                        x=prediction_data['ds'],
+                        y=prediction_data['yhat'],
+                        mode='lines',
+                        name='Forecast',
+                        line=dict(color='royalblue', width=2)
+                    )
+                )
+                
+                # Add uncertainty bands - only for prediction period
                 # Upper bound
                 fig.add_trace(
                     go.Scatter(
-                        x=forecast['ds'],
-                        y=forecast['yhat_upper'],
+                        x=prediction_data['ds'],
+                        y=prediction_data['yhat_upper'],
                         mode='lines',
                         line=dict(width=0),
                         showlegend=False
@@ -1264,51 +1440,57 @@ class EnergyMapWindow(QMainWindow):
                 # Lower bound with fill
                 fig.add_trace(
                     go.Scatter(
-                        x=forecast['ds'],
-                        y=forecast['yhat_lower'],
+                        x=prediction_data['ds'],
+                        y=prediction_data['yhat_lower'],
                         mode='lines',
                         line=dict(width=0),
                         fill='tonexty',
                         fillcolor='rgba(65, 105, 225, 0.2)',
-                        name='95% Confidence Interval'
+                        name='Prediction Interval'
                     )
                 )
-            except Exception as e:
-                print(f"Warning: Could not add confidence interval: {e}")
             
-            # Add historical data points - using proper Series boolean operations
-            if 'actual' in forecast.columns and 'source' in forecast.columns:
-                # Create explicit boolean masks
-                historical_mask = forecast['actual'].notna() & (forecast['source'] == 'Historical')
+            # Add any actual prediction points that exist in the database
+            prediction_data_mask = (forecast['source'] == 'Prediction') & forecast['actual'].notna()
+            if prediction_data_mask.any():
+                pred_points = forecast[prediction_data_mask]
+                fig.add_trace(
+                    go.Scatter(
+                        x=pred_points['ds'],
+                        y=pred_points['actual'],
+                        mode='markers',
+                        name='Prediction Data Points',
+                        marker=dict(size=8, color='orange')
+                    )
+                )
+            
+            # Calculate the last data point for smoothing the transition
+            if historical_mask.any():
+                last_historical = forecast[historical_mask].iloc[-1]
+                first_prediction_idx = forecast[prediction_mask].index[0] if prediction_mask.any() else None
                 
-                # Check if any rows match using .any() method
-                if historical_mask.any():
+                # Add a transition line between historical and prediction
+                if first_prediction_idx is not None:
+                    first_prediction = forecast.loc[first_prediction_idx]
+                    transition_x = [last_historical['ds'], first_prediction['ds']]
+                    transition_y = [last_historical['actual'], first_prediction['yhat']]
+                    
                     fig.add_trace(
                         go.Scatter(
-                            x=forecast.loc[historical_mask, 'ds'],
-                            y=forecast.loc[historical_mask, 'actual'],
-                            mode='markers',
-                            name='Historical Data',
-                            marker=dict(size=10, color='green')
+                            x=transition_x,
+                            y=transition_y,
+                            mode='lines',
+                            line=dict(color='gray', width=2, dash='dot'),
+                            showlegend=False
                         )
                     )
-                
-                # Add prediction data points
-                prediction_mask = forecast['actual'].notna() & (forecast['source'] == 'Prediction')
-                if prediction_mask.any():
-                    fig.add_trace(
-                        go.Scatter(
-                            x=forecast.loc[prediction_mask, 'ds'],
-                            y=forecast.loc[prediction_mask, 'actual'],
-                            mode='markers',
-                            name='Prediction Data',
-                            marker=dict(size=10, color='orange')
-                        )
-                    )
+            
+            # Format the plot title with proper capitalization
+            formatted_heating_type = heating_type.replace('heated_by_', '').replace('_', ' ').title()
             
             # Customize layout
             fig.update_layout(
-                title=f'{county} - {heating_type} Energy Consumption Forecast (1990-2040)',
+                title=f'{county} - {formatted_heating_type} Energy Usage Forecast (1990-2040)',
                 xaxis_title='Year',
                 yaxis_title='Number of Housing Units',
                 hovermode='x unified',
@@ -1319,7 +1501,21 @@ class EnergyMapWindow(QMainWindow):
                     x=0.01,
                     bgcolor='rgba(255, 255, 255, 0.8)'
                 ),
-                template='plotly_white'
+                template='plotly_white',
+                annotations=[
+                    dict(
+                        x=0.5,
+                        y=0,
+                        xref="paper",
+                        yref="paper",
+                        text="Uncertainty increases with forecast distance",
+                        showarrow=False,
+                        font=dict(size=12, color="gray", style="italic"),
+                        xanchor="center",
+                        yanchor="top",
+                        yshift=-30
+                    )
+                ]
             )
             
             # Format x-axis to show years only
@@ -1328,6 +1524,43 @@ class EnergyMapWindow(QMainWindow):
                 dtick="M12",  # Every 12 months
                 tickangle=45
             )
+            
+            # Add vertical line separating historical from prediction - FIXED VERSION
+            # Instead of creating a new timestamp, we'll use shape objects
+            if historical_mask.any() and prediction_mask.any():
+                # Find the last historical data point and first prediction point
+                last_historical_date = forecast[historical_mask]['ds'].max()
+                first_prediction_date = forecast[prediction_mask]['ds'].min()
+                
+                # Use the midpoint between the two dates as the dividing line
+                separator_date = last_historical_date
+                
+                # Add a shape as a vertical line
+                fig.add_shape(
+                    type="line",
+                    x0=separator_date,
+                    y0=0,
+                    x1=separator_date,
+                    y1=1,
+                    yref="paper",
+                    line=dict(
+                        color="gray",
+                        width=2,
+                        dash="dash",
+                    )
+                )
+                
+                # Add an annotation for the line
+                fig.add_annotation(
+                    x=separator_date,
+                    y=1,
+                    yref="paper",
+                    text="Historical | Predicted",
+                    showarrow=False,
+                    font=dict(size=12),
+                    xanchor="center",
+                    yanchor="bottom"
+                )
             
             # Save to HTML and display
             plot_path = os.path.join(os.path.dirname(__file__), "temp_plot.html")
@@ -1344,6 +1577,588 @@ class EnergyMapWindow(QMainWindow):
             print(f"Error creating plot: {str(e)}")
             print(f"Traceback: {traceback.format_exc()}")
             QMessageBox.warning(self, "Error", f"Failed to create plot: {str(e)}")
+
+    def plot_time_series(self, df, county, energy_type):
+        """
+        Plot time series data with uncertainty bounds for future predictions
+        """
+        if df is None or df.empty:
+            return
+        
+        plt.figure(figsize=(10, 6))
+        
+        # Determine where historical data ends and predictions begin
+        historical_mask = ~df['actual'].isna()
+        prediction_mask = ~historical_mask
+        
+        # Split data into historical and predictions
+        historical = df[historical_mask]
+        predictions = df[prediction_mask]
+        
+        # Plot historical data
+        historical_years = historical['ds'].dt.year
+        historical_values = historical['actual']
+        plt.plot(historical_years, historical_values, 'o-', color='blue', label='Historical Data')
+        
+        # Plot predictions with uncertainty
+        prediction_years = predictions['ds'].dt.year
+        prediction_values = predictions['yhat']
+        prediction_lower = predictions['yhat_lower']
+        prediction_upper = predictions['yhat_upper']
+        
+        # Plot the main prediction line
+        plt.plot(prediction_years, prediction_values, '--', color='red', label='Predictions')
+        
+        # Plot uncertainty bounds with transparency
+        plt.fill_between(prediction_years, prediction_lower, prediction_upper, 
+                        color='red', alpha=0.2, label='Prediction Interval (90%)')
+        
+        # Add title and labels
+        title = f"{energy_type.replace('heated_by_', '').replace('_', ' ').title()} Usage in {county}"
+        plt.title(title)
+        plt.xlabel('Year')
+        plt.ylabel('Number of Housing Units')
+        plt.grid(True, linestyle='--', alpha=0.7)
+        
+        # Add legend
+        plt.legend()
+        
+        # Format x-axis to show years
+        plt.xticks(range(1990, 2045, 5))
+        
+        # Enhance readability
+        plt.tight_layout()
+        
+        # Save the figure to a BytesIO object
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=100)
+        plt.close()
+        
+        # Convert to QPixmap and display
+        buf.seek(0)
+        pixmap = QPixmap()
+        pixmap.loadFromData(buf.getvalue())
+        self.plot_label.setPixmap(pixmap)
+        self.plot_label.setScaledContents(True)
+
+    def display_prophet_plot(self, model, forecast, county, heating_type):
+        """Display the Prophet model's built-in plot with uncertainty visualization"""
+        try:
+            # Ensure required libraries are available
+            try:
+                import matplotlib.pyplot as plt
+                from prophet.plot import plot_components, plot_cross_validation_metric
+                import io
+                from PyQt5.QtGui import QPixmap
+                import tempfile
+                import os
+            except ImportError as e:
+                QMessageBox.warning(self, "Missing Dependency", 
+                                  f"Required library is missing: {e}")
+                return
+                
+            # Create a temporary file for the plot
+            with tempfile.NamedTemporaryFile(suffix='.html', delete=False) as f:
+                temp_path = f.name
+            
+            # Use Prophet's built-in plot_plotly method which returns a plotly figure
+            try:
+                # First, create the plot using Prophet's built-in capability
+                from prophet.plot import plot_plotly, plot_components_plotly
+                
+                # Generate plotly figure with Prophet's built-in method
+                fig = plot_plotly(model, forecast, uncertainty=True, plot_cap=False, 
+                                include_legend=True, figsize=(1000, 600))
+                
+                # Customize the figure
+                formatted_heating_type = heating_type.replace('heated_by_', '').replace('_', ' ').title()
+                fig.update_layout(
+                    title=f'{county} - {formatted_heating_type} Energy Usage Forecast (1990-2040)',
+                    xaxis_title='Year',
+                    yaxis_title='Number of Housing Units',
+                    hovermode='x unified',
+                    template='plotly_white'
+                )
+                
+                # Save the plot to a temporary HTML file
+                import plotly.offline as py
+                py.plot(fig, filename=temp_path, auto_open=False)
+                
+                # Load the HTML file in the web view
+                self.plot_view.setUrl(QUrl.fromLocalFile(os.path.abspath(temp_path)))
+                self.plot_view.reload()
+                
+                print("Prophet plot generated successfully using plotly")
+                return
+                
+            except Exception as plotly_error:
+                print(f"Error using Prophet's plotly output: {str(plotly_error)}")
+                print("Falling back to matplotlib output")
+                
+                # Fallback to matplotlib if plotly version fails
+                try:
+                    # Create a figure
+                    plt.figure(figsize=(12, 8))
+                    
+                    # Use Prophet's built-in plotting with matplotlib
+                    model.plot(forecast, uncertainty=True, figsize=(12, 8))
+                    
+                    # Customize the plot
+                    formatted_heating_type = heating_type.replace('heated_by_', '').replace('_', ' ').title()
+                    plt.title(f'{county} - {formatted_heating_type} Energy Usage Forecast (1990-2040)')
+                    plt.xlabel('Year')
+                    plt.ylabel('Number of Housing Units')
+                    plt.grid(True, linestyle='--', alpha=0.7)
+                    
+                    # Save the figure to a temporary file
+                    plt.savefig(temp_path, format='png', dpi=100)
+                    plt.close()
+                    
+                    # Load in web view using HTML
+                    html_content = f"""
+                    <!DOCTYPE html>
+                    <html>
+                    <head>
+                        <title>Prophet Forecast</title>
+                        <style>
+                            body {{ margin: 0; padding: 0; text-align: center; }}
+                            img {{ max-width: 100%; height: auto; }}
+                        </style>
+                    </head>
+                    <body>
+                        <img src="file://{temp_path}" alt="Prophet Forecast">
+                    </body>
+                    </html>
+                    """
+                    
+                    # Save HTML to temporary file
+                    html_path = temp_path + '.html'
+                    with open(html_path, 'w') as f:
+                        f.write(html_content)
+                    
+                    # Load the HTML in the web view
+                    self.plot_view.setUrl(QUrl.fromLocalFile(os.path.abspath(html_path)))
+                    self.plot_view.reload()
+                    
+                    print("Prophet plot generated successfully using matplotlib")
+                    
+                except Exception as mpl_error:
+                    print(f"Error generating matplotlib plot: {str(mpl_error)}")
+                    QMessageBox.warning(self, "Plot Error", 
+                                      f"Failed to generate Prophet plot: {str(mpl_error)}")
+                    return
+                
+        except Exception as e:
+            import traceback
+            print(f"Error in display_prophet_plot: {str(e)}")
+            print(f"Traceback: {traceback.format_exc()}")
+            QMessageBox.warning(self, "Error", f"Failed to display Prophet plot: {str(e)}")
+
+def create_prophet_predictions(conn, county_name, heating_type):
+    """
+    Generate predictions for a county and heating type using population growth to
+    inform housing demand and maintain realistic energy type distributions.
+    """
+    # Get base county name (without 'County' suffix if present)
+    base_county_name = county_name.replace(' County', '')
+    
+    # First, get ALL energy types for this county to understand distribution patterns
+    all_energy_query = """
+    SELECT e.Year, 
+           e.heated_by_electricity, e.heated_by_gas, e.heated_by_fuel_oil, 
+           e.heated_by_other, e.no_heating, e.heated_by_lp_gas
+    FROM energy_consumption e
+    WHERE e.County = ?
+    ORDER BY e.Year
+    """
+    energy_df = pd.read_sql_query(all_energy_query, conn, params=[county_name])
+    
+    if energy_df.empty:
+        print(f"No energy data found for {county_name}")
+        return None, None
+    
+    # Get population data separately for better control
+    pop_query = """
+    SELECT County, Population_1990, Population_2000, Population_2010, Population_2020
+    FROM county_populations
+    WHERE County = ? OR County = ? OR County LIKE ?
+    """
+    pop_df = pd.read_sql_query(pop_query, conn, 
+                             params=[county_name, base_county_name, f"{base_county_name}%"])
+    
+    if pop_df.empty:
+        # Try a more fuzzy approach to find closest match
+        all_counties = pd.read_sql_query("SELECT County FROM county_populations", conn)
+        
+        for idx, pop_county in all_counties.iterrows():
+            if base_county_name.lower() in pop_county['County'].lower() or \
+               pop_county['County'].lower() in base_county_name.lower():
+                print(f"Found potential match: {pop_county['County']} for {county_name}")
+                pop_df = pd.read_sql_query(
+                    "SELECT * FROM county_populations WHERE County = ?", 
+                    conn, params=[pop_county['County']]
+                )
+                break
+    
+    # Create population dictionary by year
+    population_by_year = {}
+    
+    if not pop_df.empty:
+        # Extract population values from population table
+        if not pd.isna(pop_df['Population_1990'].iloc[0]):
+            population_by_year[1990] = float(pop_df['Population_1990'].iloc[0])
+        if not pd.isna(pop_df['Population_2000'].iloc[0]):
+            population_by_year[2000] = float(pop_df['Population_2000'].iloc[0])
+        if not pd.isna(pop_df['Population_2010'].iloc[0]):
+            population_by_year[2010] = float(pop_df['Population_2010'].iloc[0])
+        if not pd.isna(pop_df['Population_2020'].iloc[0]):
+            population_by_year[2020] = float(pop_df['Population_2020'].iloc[0])
+    
+    # If no population data was found, create synthetic population
+    if not population_by_year:
+        print(f"No population data found for {county_name}, using synthetic population")
+        # Calculate total housing units for each year
+        energy_df['total_housing'] = energy_df[['heated_by_electricity', 'heated_by_gas', 'heated_by_fuel_oil', 
+                                             'heated_by_other', 'no_heating', 'heated_by_lp_gas']].sum(axis=1)
+        
+        # Estimate population based on housing units (assume ~2.5 people per housing unit)
+        for idx, row in energy_df.iterrows():
+            population_by_year[row['Year']] = row['total_housing'] * 2.5
+    
+    # Add population column to energy_df
+    energy_df['Population'] = energy_df['Year'].map(population_by_year)
+    
+    # Fill any remaining NaN values with interpolation and extrapolation
+    # First sort by year to ensure proper interpolation
+    energy_df = energy_df.sort_values('Year')
+    
+    # Use interpolation to fill gaps
+    energy_df['Population'] = energy_df['Population'].interpolate(method='linear')
+    
+    # Handle extrapolation for any missing years at the beginning or end
+    # Forward fill for early years
+    energy_df['Population'] = energy_df['Population'].ffill()
+    # Backward fill for later years
+    energy_df['Population'] = energy_df['Population'].bfill()
+    
+    # Calculate total housing units
+    energy_df['total_housing'] = energy_df[['heated_by_electricity', 'heated_by_gas', 'heated_by_fuel_oil', 
+                                         'heated_by_other', 'no_heating', 'heated_by_lp_gas']].sum(axis=1)
+    
+    # Calculate housing units per capita ratio
+    energy_df['housing_per_capita'] = energy_df['total_housing'] / energy_df['Population']
+    
+    # Replace any infinite values (from division by zero) with the median
+    energy_df['housing_per_capita'] = energy_df['housing_per_capita'].replace([np.inf, -np.inf], np.nan)
+    energy_df['housing_per_capita'] = energy_df['housing_per_capita'].fillna(energy_df['housing_per_capita'].median())
+    
+    # Calculate the percentage of each energy type
+    for col in ['heated_by_electricity', 'heated_by_gas', 'heated_by_fuel_oil', 
+                'heated_by_other', 'no_heating', 'heated_by_lp_gas']:
+        energy_df[f'{col}_pct'] = energy_df[col] / energy_df['total_housing']
+    
+    # Fill potential NaN values with median
+    for col in [f'{c}_pct' for c in ['heated_by_electricity', 'heated_by_gas', 'heated_by_fuel_oil', 
+                                     'heated_by_other', 'no_heating', 'heated_by_lp_gas']]:
+        energy_df[col] = energy_df[col].fillna(energy_df[col].median())
+    
+    # Calculate minimum values based on historical data to prevent unrealistically low values
+    min_values = {}
+    for col in ['heated_by_electricity', 'heated_by_gas', 'heated_by_fuel_oil', 
+                'heated_by_other', 'no_heating', 'heated_by_lp_gas']:
+        # Get non-zero values
+        non_zero_values = energy_df[energy_df[col] > 0][col]
+        if not non_zero_values.empty:
+            # Set minimum to either 5% of the mean non-zero value or 1, whichever is larger
+            min_values[col] = max(int(non_zero_values.mean() * 0.05), 1)
+        else:
+            min_values[col] = 1
+    
+    # Analyze population trends
+    if len(energy_df) >= 2:
+        # Calculate average annual growth rate over all available periods
+        pop_df = energy_df[['Year', 'Population']].dropna()
+        pop_df = pop_df.sort_values('Year')
+        first_year = pop_df['Year'].min()
+        last_year = pop_df['Year'].max()
+        first_pop = pop_df.loc[pop_df['Year'] == first_year, 'Population'].iloc[0]
+        last_pop = pop_df.loc[pop_df['Year'] == last_year, 'Population'].iloc[0]
+        years_diff = last_year - first_year
+        
+        if years_diff > 0 and first_pop > 0:
+            # Calculate compound annual growth rate
+            annual_growth_rate = (last_pop / first_pop) ** (1 / years_diff) - 1
+            
+            # Ensure growth rate is realistic (between -0.5% and 3% per year)
+            annual_growth_rate = max(-0.005, min(annual_growth_rate, 0.03))
+            
+            # Apply growth rate to project future population
+            latest_pop = pop_df.loc[pop_df['Year'] == pop_df['Year'].max(), 'Population'].iloc[0]
+            projected_populations = np.array([
+                latest_pop * (1 + annual_growth_rate) ** (i + 1) for i in range(4)
+            ])
+        else:
+            # Fallback to state average growth
+            latest_pop = pop_df.loc[pop_df['Year'] == pop_df['Year'].max(), 'Population'].iloc[0]
+            projected_populations = np.array([
+                latest_pop * 1.05,  # 2025: 5% growth from latest
+                latest_pop * 1.10,  # 2030: 10% growth
+                latest_pop * 1.15,  # 2035: 15% growth
+                latest_pop * 1.20   # 2040: 20% growth
+            ])
+    else:
+        # Without enough population data, use state average growth rates
+        last_known_year = energy_df['Year'].max()
+        last_known_pop = energy_df.loc[energy_df['Year'] == last_known_year, 'Population'].iloc[0]
+        
+        # Estimate growth rates based on NC state average (approx 1% per year)
+        projected_populations = np.array([
+            last_known_pop * 1.05,  # 2025
+            last_known_pop * 1.10,  # 2030
+            last_known_pop * 1.15,  # 2035
+            last_known_pop * 1.20   # 2040
+        ])
+    
+    # Get most recent energy type distribution (percentages)
+    latest_year = energy_df['Year'].max()
+    latest_data = energy_df[energy_df['Year'] == latest_year]
+    
+    # Get most recent housing per capita ratio
+    latest_housing_per_capita = latest_data['housing_per_capita'].iloc[0]
+    
+    # Create future dataframe with projected data
+    future_data = []
+    future_years = [2025, 2030, 2035, 2040]
+    
+    # Analyze trend for each energy type
+    trends = {}
+    
+    for col in ['heated_by_electricity', 'heated_by_gas', 'heated_by_fuel_oil', 
+                'heated_by_other', 'no_heating', 'heated_by_lp_gas']:
+        pct_col = f'{col}_pct'
+        
+        # Check if there's a trend in the percentage over time
+        if len(energy_df) >= 3:  # Need at least 3 years to detect a reliable trend
+            # Calculate linear trend in percentage
+            X_trend = energy_df['Year'].values.reshape(-1, 1)
+            y_trend = energy_df[pct_col].values
+            trend_model = LinearRegression()
+            trend_model.fit(X_trend, y_trend)
+            
+            # Store trend
+            trends[col] = {
+                'slope': trend_model.coef_[0],
+                'intercept': trend_model.intercept_
+            }
+        else:
+            # Not enough data for trend, use latest percentage
+            trends[col] = {
+                'slope': 0,
+                'intercept': latest_data[pct_col].iloc[0]
+            }
+    
+    # Determine decline rate thresholds based on energy type
+    decline_thresholds = {
+        'heated_by_electricity': 0,  # No decline floor for electricity (growing)
+        'heated_by_gas': 0.3,        # At least 30% of latest value for gas
+        'heated_by_fuel_oil': 0.4,   # At least 40% of latest value for fuel oil
+        'heated_by_other': 0.4,      # At least 40% of latest value for other
+        'no_heating': 0.5,           # At least 50% of latest value for no heating
+        'heated_by_lp_gas': 0.3      # At least 30% of latest value for LP gas
+    }
+    
+    # Generate future projections
+    for i, year in enumerate(future_years):
+        future_row = {'Year': year, 'Population': projected_populations[i]}
+        
+        # Calculate expected total housing units based on population and housing per capita
+        future_row['total_housing'] = future_row['Population'] * latest_housing_per_capita
+        
+        # First pass - calculate raw projections based on trends
+        raw_projections = {}
+        
+        for col in ['heated_by_electricity', 'heated_by_gas', 'heated_by_fuel_oil', 
+                    'heated_by_other', 'no_heating', 'heated_by_lp_gas']:
+            # Predict percentage using trend
+            trend = trends[col]
+            predicted_pct = trend['slope'] * year + trend['intercept']
+            
+            # Ensure percentage is between 0 and 1
+            predicted_pct = max(0, min(predicted_pct, 1))
+            
+            # Calculate predicted units
+            predicted_units = int(round(future_row['total_housing'] * predicted_pct))
+            
+            # Get latest historical value for this energy type
+            latest_value = latest_data[col].iloc[0]
+            
+            # Apply decline threshold - ensure prediction doesn't drop too much from latest value
+            decline_threshold = decline_thresholds[col]
+            min_value_by_threshold = int(latest_value * decline_threshold)
+            
+            # Apply minimum value constraint - use the larger of the threshold or the min from statistics
+            final_min = max(min_value_by_threshold, min_values[col])
+            
+            # Ensure predicted value is at least the minimum
+            if predicted_units < final_min:
+                predicted_units = final_min
+            
+            # Store prediction
+            raw_projections[col] = predicted_units
+        
+        # Second pass - normalize percentages to ensure they sum to total housing
+        total_predicted = sum(raw_projections.values())
+        
+        if total_predicted > future_row['total_housing']:
+            # Scale down proportionally if over total
+            scale_factor = future_row['total_housing'] / total_predicted
+            for col in raw_projections:
+                raw_projections[col] = int(round(raw_projections[col] * scale_factor))
+        
+        # Add final projections to future row
+        for col, value in raw_projections.items():
+            future_row[col] = value
+        
+        future_data.append(future_row)
+    
+    # Create future DataFrame
+    future_df = pd.DataFrame(future_data)
+    
+    # Get training data for Prophet - just the selected heating type
+    df = pd.DataFrame({
+        'Year': energy_df['Year'],
+        heating_type: energy_df[heating_type],
+        'Population': energy_df['Population']
+    })
+    
+    # Now prepare for Prophet model
+    prophet_df = pd.DataFrame({
+        'ds': pd.to_datetime(df['Year'].astype(str)),
+        'y': df[heating_type],
+        'population': df['Population']
+    })
+    
+    # Double check for NaN values in the prophet_df
+    if prophet_df.isnull().any().any():
+        print(f"Warning: Found NaN values in prophet_df for {county_name}, {heating_type}")
+        # Fill NaN values in population column
+        prophet_df['population'] = prophet_df['population'].interpolate().ffill().bfill()
+        # Fill NaN values in y column with 0
+        prophet_df['y'] = prophet_df['y'].fillna(0)
+    
+    # Create Prophet model
+    model = Prophet(
+        yearly_seasonality=False,
+        growth='linear',
+        changepoint_prior_scale=0.05  # More conservative to prevent overfit
+    )
+    
+    # Add population as a regressor
+    model.add_regressor('population')
+    
+    # Fit the model
+    try:
+        model.fit(prophet_df)
+    except Exception as e:
+        print(f"Error fitting Prophet model for {county_name}, {heating_type}: {e}")
+        # Return distribution-based predictions as fallback
+        predictions = pd.DataFrame({
+            'County': county_name,
+            'Year': future_df['Year'],
+            heating_type: future_df[heating_type]
+        })
+        return predictions[['County', 'Year', heating_type]], None
+    
+    # Create future dataframe for Prophet
+    prophet_future = pd.DataFrame({
+        'ds': pd.to_datetime(future_df['Year'].astype(str)),
+        'population': future_df['Population']
+    })
+    
+    # Make prediction with Prophet
+    forecast = model.predict(prophet_future)
+    
+    # Compare Prophet's predictions with our distribution-based predictions
+    prophet_predictions = forecast['yhat'].values
+    distribution_predictions = future_df[heating_type].values
+    
+    # Blend the predictions with different weights based on energy type
+    if heating_type in ['heated_by_fuel_oil', 'heated_by_other']:
+        # These types often show unrealistic decline in Prophet - use more distribution weight
+        blend_weights = {
+            2025: [0.3, 0.7],  # 30% Prophet, 70% distribution
+            2030: [0.2, 0.8],  # 20% Prophet, 80% distribution
+            2035: [0.15, 0.85], # 15% Prophet, 85% distribution
+            2040: [0.1, 0.9]   # 10% Prophet, 90% distribution
+        }
+    elif heating_type in ['heated_by_lp_gas']:
+        # Moderate blend for LP gas
+        blend_weights = {
+            2025: [0.4, 0.6],  # 40% Prophet, 60% distribution
+            2030: [0.35, 0.65], # 35% Prophet, 65% distribution
+            2035: [0.3, 0.7],  # 30% Prophet, 70% distribution
+            2040: [0.25, 0.75]  # 25% Prophet, 75% distribution
+        }
+    else:
+        # Standard blend for other types
+        blend_weights = {
+            2025: [0.5, 0.5],  # 50% Prophet, 50% distribution
+            2030: [0.5, 0.5],  # 50% Prophet, 50% distribution
+            2035: [0.5, 0.5],  # 50% Prophet, 50% distribution
+            2040: [0.5, 0.5]   # 50% Prophet, 50% distribution
+        }
+    
+    # Apply blending with year-specific weights
+    blended_predictions = []
+    for i, year in enumerate(future_years):
+        weights = blend_weights[year]
+        prophet_weight, dist_weight = weights
+        
+        # Apply weighted blend
+        blended_value = int(round(
+            prophet_weight * prophet_predictions[i] + dist_weight * distribution_predictions[i]
+        ))
+        
+        # Ensure value is at least the minimum for this energy type
+        blended_value = max(blended_value, min_values[heating_type])
+        
+        # For declining energy types, ensure we don't go below threshold of latest value
+        if heating_type in ['heated_by_fuel_oil', 'heated_by_other', 'heated_by_lp_gas']:
+            latest_value = latest_data[heating_type].iloc[0] 
+            # Calculate minimum based on decline threshold and years into future
+            years_out = (i + 1)
+            # Apply progressively stronger floors for further years
+            year_factor = max(0.1, 1 - (0.2 * years_out))  # 0.8, 0.6, 0.4, 0.2
+            floor_value = int(latest_value * decline_thresholds[heating_type] * year_factor)
+            
+            # Apply the floor, but ensure it's at least min_values[heating_type]
+            blended_value = max(blended_value, floor_value, min_values[heating_type])
+        
+        blended_predictions.append(blended_value)
+    
+    # Create prediction DataFrame for database
+    predictions = pd.DataFrame({
+        'County': county_name,
+        'Year': future_df['Year'],
+        heating_type: blended_predictions
+    })
+    
+    print(f"Generated {len(predictions)} predictions for {county_name}, {heating_type}")
+    print(f"  Prophet: {prophet_predictions.astype(int)}")
+    print(f"  Distribution-based: {distribution_predictions}")
+    print(f"  Blended (final): {blended_predictions}")
+    
+    # Also return confidence intervals for visualization
+    prediction_intervals = pd.DataFrame({
+        'County': county_name,
+        'Year': future_df['Year'],
+        f'{heating_type}_lower': np.maximum(forecast['yhat_lower'].values.astype(int), 
+                                          [min_values[heating_type]] * len(future_years)),
+        f'{heating_type}_upper': forecast['yhat_upper'].values.astype(int),
+        heating_type: blended_predictions
+    })
+    
+    return predictions[['County', 'Year', heating_type]], model, prediction_intervals
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
